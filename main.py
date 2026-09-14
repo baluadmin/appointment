@@ -6,8 +6,9 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import PlainTextResponse
+from google import genai
+from google.genai import types
 import httpx
-from openai import OpenAI
 
 load_dotenv()
 
@@ -18,16 +19,15 @@ WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "stataibooking2026")
 OWNER_PHONE_NUMBER = os.getenv("OWNER_PHONE_NUMBER")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-CAL_API_KEY = os.getenv("CAL_API_KEY")
-CAL_EVENT_TYPE_ID = int(os.getenv("CAL_EVENT_TYPE_ID", "0"))
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GOOGLE_SHEET_WEBHOOK_URL = os.getenv("GOOGLE_SHEET_WEBHOOK_URL")
 
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
+ai_client = genai.Client(api_key=GEMINI_API_KEY)
 app = FastAPI(title="STATAI WhatsApp Booking Service")
 
 
 # ---------------------------------------------------------
-# Webhook Verification (Handshake with Meta)
+# Webhook Verification (Meta Handshake)
 # ---------------------------------------------------------
 @app.get("/webhook", response_class=PlainTextResponse)
 async def verify_webhook(
@@ -62,13 +62,13 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                 user_text = message_obj["text"]["body"]
                 background_tasks.add_task(handle_booking_pipeline, sender_id, user_text)
     except (IndexError, KeyError, TypeError) as err:
-        logger.debug(f"Non-message event skipped: {err}")
+        logger.debug(f"Skipped non-message payload: {err}")
 
     return Response(status_code=200)
 
 
 # ---------------------------------------------------------
-# WhatsApp Cloud API Message Sender
+# WhatsApp Cloud API Message Dispatcher
 # ---------------------------------------------------------
 async def send_whatsapp_message(to: str, message: str):
     url = f"https://graph.facebook.com/v20.0/{PHONE_NUMBER_ID}/messages"
@@ -86,125 +86,122 @@ async def send_whatsapp_message(to: str, message: str):
     async with httpx.AsyncClient(timeout=10.0) as client:
         res = await client.post(url, headers=headers, json=payload)
         if res.status_code >= 400:
-            logger.error(f"Failed to send message to {to}: {res.text}")
+            logger.error(f"Failed to send WhatsApp message to {to}: {res.text}")
         else:
-            logger.info(f"Message delivered to {to}")
+            logger.info(f"Delivered WhatsApp message to {to}")
 
 
 # ---------------------------------------------------------
-# Cal.com Booking Creation
+# Google Sheets Logger
 # ---------------------------------------------------------
-async def create_cal_booking(name: str, email: str, start_iso: str, notes: str) -> bool:
-    url = "https://api.cal.com/v2/bookings"
-    headers = {
-        "Authorization": f"Bearer {CAL_API_KEY}",
-        "Content-Type": "application/json",
-        "cal-api-version": "2026-02-25",
-    }
+async def log_to_google_sheet(name: str, phone: str, email: str, slot: str, notes: str) -> bool:
+    if not GOOGLE_SHEET_WEBHOOK_URL:
+        logger.error("GOOGLE_SHEET_WEBHOOK_URL is not set.")
+        return False
+
     payload = {
-        "eventTypeId": CAL_EVENT_TYPE_ID,
-        "start": start_iso,
-        "attendee": {
-            "name": name,
-            "email": email,
-            "timeZone": "Asia/Kolkata",
-            "language": "en",
-        },
-        "metadata": {"notes": notes},
+        "name": name,
+        "phone": phone,
+        "email": email,
+        "slot": slot,
+        "notes": notes,
     }
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        res = await client.post(url, headers=headers, json=payload)
-        if res.status_code in [200, 201]:
+    # follow_redirects=True is necessary for Google Apps Script redirects
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        res = await client.post(GOOGLE_SHEET_WEBHOOK_URL, json=payload)
+        if res.status_code == 200:
+            logger.info("Successfully recorded row in Google Sheet.")
             return True
-        logger.error(f"Cal.com booking failed: {res.status_code} - {res.text}")
+        logger.error(f"Failed to log into Google Sheet: {res.status_code} - {res.text}")
         return False
 
 
 # ---------------------------------------------------------
-# OpenAI Function Calling & Dialog Engine
+# Gemini Function Calling Definition
 # ---------------------------------------------------------
-booking_tool = {
-    "type": "function",
-    "function": {
-        "name": "book_appointment",
-        "description": "Call this when the user has supplied their name, email, and preferred appointment start time.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "Customer full name"},
-                "email": {"type": "string", "description": "Customer email address"},
-                "start_time_iso": {
-                    "type": "string",
-                    "description": "Start date-time in ISO 8601 format (e.g., 2026-09-14T15:00:00+05:30)",
+booking_tool = types.Tool(
+    function_declarations=[
+        types.FunctionDeclaration(
+            name="record_appointment",
+            description="Call when customer provides Name, Email, and Preferred Date/Time for appointment.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "name": types.Schema(type=types.Type.STRING, description="Customer full name"),
+                    "email": types.Schema(type=types.Type.STRING, description="Customer email address"),
+                    "slot": types.Schema(
+                        type=types.Type.STRING,
+                        description="Requested date and time in readable format (e.g., 2026-09-15 04:00 PM)",
+                    ),
+                    "notes": types.Schema(type=types.Type.STRING, description="Service needed or extra notes"),
                 },
-                "notes": {"type": "string", "description": "Service needed or discussion notes"},
-            },
-            "required": ["name", "email", "start_time_iso"],
-        },
-    },
-}
+                required=["name", "email", "slot"],
+            ),
+        )
+    ]
+)
 
 
 async def handle_booking_pipeline(sender_id: str, incoming_text: str):
     now_ist = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%A, %Y-%m-%d %I:%M %p")
 
-    system_prompt = f"""You are the automated booking assistant for STAT AI.
+    system_instruction = f"""You are the automated booking assistant for STAT AI.
 Current Date & Time: {now_ist} (Timezone: Asia/Kolkata).
 
-Rules:
-1. Greet politely and help customers book appointments.
-2. To book, you need: Customer Name, Email, and Preferred Date/Time.
-3. If information is missing, ask for only what is missing in a single short sentence.
-4. When all three details are provided, invoke the `book_appointment` tool. Calculate the start_time_iso accurately according to the current date and time provided.
-5. Keep conversational replies brief and friendly for WhatsApp.
+Instructions:
+1. Greet politely and help customers book their appointment.
+2. Require three items: Customer Name, Email, and Preferred Date/Time.
+3. If details are missing, ask specifically for the missing item in one friendly sentence.
+4. When all three details are provided, invoke `record_appointment`.
+5. Keep general conversational replies brief and concise for WhatsApp.
 """
 
-    response = openai_client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": incoming_text},
-        ],
-        tools=[booking_tool],
-        tool_choice="auto",
+    response = ai_client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=incoming_text,
+        config=types.GenerateContentConfig(
+            system_instruction=system_instruction,
+            tools=[booking_tool],
+            temperature=0.3,
+        ),
     )
 
-    choice = response.choices[0].message
-
-    if choice.tool_calls:
-        tool_call = choice.tool_calls[0]
-        args = json.loads(tool_call.function.arguments)
+    if response.function_calls:
+        call = response.function_calls[0]
+        args = call.args
 
         name = args.get("name")
         email = args.get("email")
-        start_iso = args.get("start_time_iso")
-        notes = args.get("notes", "STAT AI WhatsApp Appointment")
+        slot = args.get("slot")
+        notes = args.get("notes", "WhatsApp Appointment")
 
-        success = await create_cal_booking(name, email, start_iso, notes)
+        success = await log_to_google_sheet(name, sender_id, email, slot, notes)
 
         if success:
-            customer_msg = (
+            customer_reply = (
                 f"Booking confirmed!\n\n"
                 f"Name: {name}\n"
-                f"Slot: {start_iso}\n"
-                f"A calendar invitation has been sent to {email}."
+                f"Slot: {slot}\n\n"
+                f"Our team has logged your appointment and will reach out to {email} shortly."
             )
-            owner_msg = (
-                f"*New Appointment Confirmed*\n"
+            owner_alert = (
+                f"*New Booking Added to Google Sheet*\n"
                 f"Customer: {name}\n"
                 f"Phone: +{sender_id}\n"
                 f"Email: {email}\n"
-                f"Scheduled for: {start_iso}"
+                f"Requested Slot: {slot}\n"
+                f"Notes: {notes}"
             )
-            await send_whatsapp_message(sender_id, customer_msg)
+            await send_whatsapp_message(sender_id, customer_reply)
             if OWNER_PHONE_NUMBER:
-                await send_whatsapp_message(OWNER_PHONE_NUMBER, owner_msg)
+                await send_whatsapp_message(OWNER_PHONE_NUMBER, owner_alert)
         else:
             await send_whatsapp_message(
                 sender_id,
-                "We could not confirm that specific time slot. Please choose another date or time.",
+                "We encountered a temporary technical glitch while logging your appointment. Please try again shortly.",
             )
     else:
-        reply = choice.content
-        await send_whatsapp_message(sender_id, reply)
+        reply = response.text
+        if reply:
+            await send_whatsapp_message(sender_id, reply)
